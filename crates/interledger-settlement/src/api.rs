@@ -1,6 +1,6 @@
 use super::{
-    Convert, ConvertDetails, IdempotentData, IdempotentStore, Quantity, SettlementAccount,
-    SettlementStore, SE_ILP_ADDRESS,
+    Convert, ConvertDetails, IdempotentData, IdempotentStore, LeftoversStore, Quantity,
+    SettlementAccount, SettlementStore, SE_ILP_ADDRESS,
 };
 use bytes::Bytes;
 use futures::{
@@ -9,10 +9,11 @@ use futures::{
 };
 use hyper::{Response, StatusCode};
 use interledger_packet::PrepareBuilder;
-use interledger_service::{AccountStore, OutgoingRequest, OutgoingService};
-use log::{debug, error};
+use interledger_service::{Account, AccountStore, OutgoingRequest, OutgoingService};
+use log::error;
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
+use num_traits::Zero;
 use ring::digest::{digest, SHA256};
 use serde_json::json;
 use std::{
@@ -38,7 +39,7 @@ pub struct SettlementApi<S, O, A> {
 impl_web! {
     impl<S, O, A> SettlementApi<S, O, A>
     where
-        S: SettlementStore<Account = A> + IdempotentStore + AccountStore<Account = A> + Clone + Send + Sync + 'static,
+        S: LeftoversStore<AccountId = <A as Account>::AccountId, AssetType = BigUint> + SettlementStore<Account = A> + IdempotentStore + AccountStore<Account = A> + Clone + Send + Sync + 'static,
         O: OutgoingService<A> + Clone + Send + Sync + 'static,
         A: SettlementAccount + Send + Sync + 'static,
     {
@@ -149,24 +150,36 @@ impl_web! {
 
         fn do_receive_settlement(&self, account_id: String, body: Quantity, idempotency_key: Option<String>) -> Box<dyn Future<Item = (StatusCode, Bytes), Error = (StatusCode, String)> + Send> {
             let store = self.store.clone();
-            let amount = body.amount;
+            let store_clone = self.store.clone();
+            let engine_amount = body.amount;
             let engine_scale = body.scale;
-            Box::new(result(A::AccountId::from_str(&account_id)
-            .map_err(move |_err| {
-                let error_msg = format!("Unable to parse account id: {}", account_id);
-                error!("{}", error_msg);
-                (StatusCode::from_u16(400).unwrap(), error_msg)
-            }))
-            .and_then({
-                let store = store.clone();
-                move |account_id| {
-                store.get_accounts(vec![account_id])
-                .map_err(move |_err| {
-                    let error_msg = format!("Error getting account: {}", account_id);
+
+            // Convert to the desired data types
+            let account_id = match A::AccountId::from_str(&account_id) {
+                Ok(a) => a,
+                Err(_) => {
+                    let error_msg = format!("Unable to parse account id: {}", account_id);
                     error!("{}", error_msg);
-                    (StatusCode::from_u16(404).unwrap(), error_msg)
-                })
-            }})
+                    return Box::new(err((StatusCode::from_u16(400).unwrap(), error_msg)))
+                }
+            };
+
+            let engine_amount = match BigUint::from_str(&engine_amount) {
+                Ok(a) => a,
+                Err(_) => {
+                    let error_msg = format!("Could not convert amount: {:?}", engine_amount);
+                    error!("{}", error_msg);
+                    return Box::new(err((StatusCode::from_u16(500).unwrap(), error_msg)))
+                }
+            };
+
+            Box::new(
+            store.get_accounts(vec![account_id])
+            .map_err(move |_err| {
+                let error_msg = format!("Error getting account: {}", account_id);
+                error!("{}", error_msg);
+                (StatusCode::from_u16(404).unwrap(), error_msg)
+            })
             .and_then(move |accounts| {
                 let account = &accounts[0];
                 if account.settlement_engine_details().is_some() {
@@ -178,42 +191,48 @@ impl_web! {
                 }
             })
             .and_then(move |account| {
-                result(BigUint::from_str(&amount))
-                .map_err(move |_| {
-                    let error_msg = format!("Could not convert amount: {:?}", amount);
+                let account_id = account.id();
+                let asset_scale = account.asset_scale();
+                // Scale to account's scale from the engine's scale
+                // If we're downscaling we might have some precision error which
+                // we must save as leftovers. Upscaling is OK since we're using
+                // biguint's.
+                let (scaled_engine_amount, precision_loss) = scale_with_precision_loss(engine_amount, asset_scale, engine_scale);
+
+                // This will load any leftovers (which are saved in the highest
+                // so far received scale by the engine), will scale them to
+                // the account's asset scale and return them. If there was any
+                // precision loss due to downscaling, it will also update the
+                // leftovers to the new leftovers value
+                store_clone.load_uncredited_settlement_amount(account_id, asset_scale)
+                .map_err(move |_err| {
+                    let error_msg = format!("Error getting uncredited settlement amount for: {}", account.id());
                     error!("{}", error_msg);
                     (StatusCode::from_u16(500).unwrap(), error_msg)
                 })
-                .and_then(move |amount_from_engine| {
-                    let account_id = account.id();
-                    let amount = amount_from_engine.normalize_scale(ConvertDetails {
-                        from: engine_scale,
-                        to: account.asset_scale(),
-                    });
-                    result(amount.clone())
+                .and_then(move |scaled_leftover_amount| {
+                    // add the leftovers to the scaled engine amount
+                    let total_amount = scaled_engine_amount.clone() + scaled_leftover_amount;
+                    let engine_amount_u64 = total_amount.to_u64().unwrap_or(std::u64::MAX);
+
+                    futures::future::join_all(vec![
+                        // update the account's balance in the store
+                        store.update_balance_for_incoming_settlement(account_id, engine_amount_u64, idempotency_key),
+                        // save any precision loss that occurred during the
+                        // scaling of the engine's amount to the account's scale
+                        store.save_uncredited_settlement_amount(account_id, (precision_loss, engine_scale))
+                    ])
                     .map_err(move |_| {
-                        let error_msg = format!("Could not convert amount: {:?}", amount);
+                        let error_msg = format!("Error updating the balance and leftovers of account: {}", account_id);
                         error!("{}", error_msg);
                         (StatusCode::from_u16(500).unwrap(), error_msg)
                     })
-                    .and_then(move |amount| {
-                        // If we'd overflow, settle for the maximum u64 value
-                        let amount = if let Some(amount_u64) = amount.to_u64() {
-                            amount_u64
-                        } else {
-                            debug!("Amount settled from engine overflowed during conversion to connector scale: {:?}. Settling for u64::MAX", amount);
-                            std::u64::MAX
-                        };
-                        store.update_balance_for_incoming_settlement(account_id, amount, idempotency_key)
-                        .map_err(move |_| {
-                            let error_msg = format!("Error updating balance of account: {} for incoming settlement of amount: {}", account_id, amount);
-                            error!("{}", error_msg);
-                            (StatusCode::from_u16(500).unwrap(), error_msg)
-                        })
-                        .and_then(move |_| {
-                            let quantity = json!(Quantity::new(amount, account.asset_scale()));
-                            Ok((StatusCode::OK, quantity.to_string().into()))
-                        })
+                    .and_then(move |_| {
+                        // the connector "lies" and tells the engine that it
+                        // settled the full amount. Precision loss is handled by
+                        // the connector.
+                        let quantity = json!(Quantity::new(total_amount, asset_scale));
+                        Ok((StatusCode::OK, quantity.to_string().into()))
                     })
                 })
             }))
@@ -303,7 +322,41 @@ impl_web! {
                 .serve(incoming)
         }
     }
+}
 
+pub fn scale_with_precision_loss(
+    amount: BigUint,
+    local_scale: u8,
+    remote_scale: u8,
+) -> (BigUint, BigUint) {
+    // It's safe to unwrap here since BigUint's normalize_scale cannot fail.
+    let scaled = amount
+        .normalize_scale(ConvertDetails {
+            from: remote_scale,
+            to: local_scale,
+        })
+        .unwrap();
+
+    if local_scale < remote_scale {
+        // If we ended up downscaling, scale the value back up back,
+        // and return any precision loss
+        // note that `from` and `to` are reversed compared to the previous call
+        let upscaled = scaled
+            .normalize_scale(ConvertDetails {
+                from: local_scale,
+                to: remote_scale,
+            })
+            .unwrap();
+        let precision_loss = if upscaled < amount {
+            amount - upscaled
+        } else {
+            Zero::zero()
+        };
+        (scaled, precision_loss)
+    } else {
+        // there is no need to do anything further if we upscaled
+        (scaled, Zero::zero())
+    }
 }
 
 fn get_hash_of(preimage: &[u8]) -> [u8; 32] {
@@ -317,6 +370,24 @@ mod tests {
     use super::*;
     use crate::fixtures::*;
     use crate::test_helpers::*;
+
+    #[test]
+    fn precision_loss() {
+        assert_eq!(
+            scale_with_precision_loss(BigUint::from(905u32), 9, 11),
+            (BigUint::from(9u32), BigUint::from(5u32))
+        );
+
+        assert_eq!(
+            scale_with_precision_loss(BigUint::from(8053u32), 9, 12),
+            (BigUint::from(8u32), BigUint::from(53u32))
+        );
+
+        assert_eq!(
+            scale_with_precision_loss(BigUint::from(1u32), 9, 6),
+            (BigUint::from(1000u32), BigUint::from(0u32))
+        );
+    }
 
     // Settlement Tests
     mod settlement_tests {
@@ -407,6 +478,100 @@ mod tests {
             assert_eq!(cached_data.0, StatusCode::OK);
             let quantity: Quantity = serde_json::from_slice(&cached_data.1).unwrap();
             assert_eq!(quantity, Quantity::new(2, CONNECTOR_SCALE));
+        }
+
+        #[test]
+        // The connector must save the difference each time there's precision
+        // loss and try to add it the amount it's being notified to settle for the next time.
+        fn settlement_leftovers() {
+            let id = TEST_ACCOUNT_0.clone().id.to_string();
+            let store = test_store(false, true);
+            let api = test_api(store.clone(), false);
+
+            // Send 205 with scale 11, 2 decimals lost -> 0.05 leftovers
+            let ret: Response<_> = api
+                .receive_settlement(id.clone(), Quantity::new(205, 11), None)
+                .wait()
+                .unwrap();
+            assert_eq!(ret.status(), 200);
+
+            // balance should be 2
+            assert_eq!(store.get_balance(TEST_ACCOUNT_0.id), 2);
+            assert_eq!(
+                store
+                    .get_uncredited_settlement_amount(TEST_ACCOUNT_0.id)
+                    .wait()
+                    .unwrap(),
+                (BigUint::from(5u32), 11)
+            );
+
+            // Send 855 with scale 12, 3 decimals lost -> 0.855 leftovers,
+            let ret: Response<_> = api
+                .receive_settlement(id.clone(), Quantity::new(855, 12), None)
+                .wait()
+                .unwrap();
+            assert_eq!(ret.status(), 200);
+            // balance should remain unchanged since the leftovers were smaller
+            // than a unit's worth
+            assert_eq!(store.get_balance(TEST_ACCOUNT_0.id), 2);
+            // total leftover: 0.905 = 0.05 + 0.855
+            assert_eq!(
+                store
+                    .get_uncredited_settlement_amount(TEST_ACCOUNT_0.id)
+                    .wait()
+                    .unwrap(),
+                (BigUint::from(905u32), 12)
+            );
+
+            // send 110 with scale 11, 2 decimals lost -> 0.1 leftover
+            let ret: Response<_> = api
+                .receive_settlement(id.clone(), Quantity::new(110, 11), None)
+                .wait()
+                .unwrap();
+            assert_eq!(ret.status(), 200);
+            // total leftover 1.005 = 0.905 + 0.1
+            // leftovers will get applied on the next settlement
+            assert_eq!(store.get_balance(TEST_ACCOUNT_0.id), 3);
+            assert_eq!(
+                store
+                    .get_uncredited_settlement_amount(TEST_ACCOUNT_0.id)
+                    .wait()
+                    .unwrap(),
+                (BigUint::from(1005u32), 12)
+            );
+
+            // send 5 with scale 9, will consume the leftovers and increase
+            // total balance by 6 while updating the rest of the leftovers
+            let ret: Response<_> = api
+                .receive_settlement(id.clone(), Quantity::new(5, 9), None)
+                .wait()
+                .unwrap();
+            assert_eq!(ret.status(), 200);
+            // 5 from this call + 3 from before + 1 from leftovers = 9
+            assert_eq!(store.get_balance(TEST_ACCOUNT_0.id), 9);
+            assert_eq!(
+                store
+                    .get_uncredited_settlement_amount(TEST_ACCOUNT_0.id)
+                    .wait()
+                    .unwrap(),
+                (BigUint::from(5u32), 12)
+            );
+
+            // we send a payment with a smaller scale than the account now
+            let ret: Response<_> = api
+                .receive_settlement(id.clone(), Quantity::new(2, 7), None)
+                .wait()
+                .unwrap();
+            assert_eq!(ret.status(), 200);
+            assert_eq!(store.get_balance(TEST_ACCOUNT_0.id), 209);
+            // leftovers are still the same
+            assert_eq!(
+                store
+                    .get_uncredited_settlement_amount(TEST_ACCOUNT_0.id)
+                    .wait()
+                    .unwrap(),
+                (BigUint::from(5u32), 12)
+            );
         }
 
         #[test]

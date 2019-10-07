@@ -22,7 +22,7 @@ mod test_helpers;
 use num_bigint::BigUint;
 use std::ops::{Div, Mul};
 
-pub use api::SettlementApi;
+pub use api::{scale_with_precision_loss, SettlementApi};
 pub use client::SettlementClient;
 pub use message_service::SettlementMessageService;
 
@@ -96,6 +96,35 @@ pub trait IdempotentStore {
         status_code: StatusCode,
         data: Bytes,
     ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
+}
+
+pub trait LeftoversStore {
+    type AccountId;
+    type AssetType: ToString;
+
+    /// Saves the leftover data
+    fn save_uncredited_settlement_amount(
+        &self,
+        // The account id that for which there was a precision loss
+        account_id: Self::AccountId,
+        // The amount for which precision loss occurred, along with their scale
+        uncredited_settlement_amount: (Self::AssetType, u8),
+    ) -> Box<dyn Future<Item = (), Error = ()> + Send>;
+
+    /// Returns the leftover data scaled to `local_scale` from the saved scale.
+    /// If any precision loss occurs during the scaling, it should be saved as
+    /// the new leftover value.
+    fn load_uncredited_settlement_amount(
+        &self,
+        account_id: Self::AccountId,
+        local_scale: u8,
+    ) -> Box<dyn Future<Item = Self::AssetType, Error = ()> + Send>;
+
+    // Gets the current amount of leftovers in the store
+    fn get_uncredited_settlement_amount(
+        &self,
+        account_id: Self::AccountId,
+    ) -> Box<dyn Future<Item = (Self::AssetType, u8), Error = ()> + Send>;
 }
 
 #[derive(Debug)]
