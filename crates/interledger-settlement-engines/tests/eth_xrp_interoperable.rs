@@ -123,7 +123,7 @@ fn eth_xrp_interoperable() {
         "ilp_over_http_outgoing_token" : "alice:alice_password",
         "min_balance": -1_000_000_000,
         "settle_threshold": 70000,
-        "settle_to": 10000,
+        "settle_to": "10000", // This field is a string rather than a number to test deserialiation
         "settlement_engine_url": format!("http://localhost:{}", node1_engine),
         "routing_relation": "Peer",
     });
