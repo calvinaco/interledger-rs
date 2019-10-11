@@ -124,6 +124,8 @@ pub fn encrypt_token(encryption_key: &aead::SealingKey, token: &[u8]) -> Bytes {
         .expect("Unable to get sufficient entropy for nonce");
     let nonce_copy = nonce;
     let nonce = aead::Nonce::assume_unique_for_key(nonce);
+    println!("127: {}", token.len());
+    println!("128: {}", encryption_key.algorithm().tag_len());
     if let Ok(out_len) = aead::seal_in_place(
         &encryption_key,
         nonce,
@@ -131,6 +133,8 @@ pub fn encrypt_token(encryption_key: &aead::SealingKey, token: &[u8]) -> Bytes {
         &mut token,
         encryption_key.algorithm().tag_len(),
     ) {
+        println!("136: {}", out_len);
+        println!("137: {} {:#?}", token.len(), token);
         token.split_off(out_len);
         token.append(&mut nonce_copy.as_ref().to_vec());
         Bytes::from(token)
